@@ -1,222 +1,141 @@
-/*
-Disclaimer: Use of Unaudited Code for Educational Purposes Only
-This code is provided strictly for educational purposes and has not undergone any formal security audit. 
-It may contain errors, vulnerabilities, or other issues that could pose risks to the integrity of your system or data.
-
-By using this code, you acknowledge and agree that:
-    - No Warranty: The code is provided "as is" without any warranty of any kind, either express or implied. The entire risk as to the quality and performance of the code is with you.
-    - Educational Use Only: This code is intended solely for educational and learning purposes. It is not intended for use in any mission-critical or production systems.
-    - No Liability: In no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the use or performance of this code.
-    - Security Risks: The code may not have been tested for security vulnerabilities. It is your responsibility to conduct a thorough security review before using this code in any sensitive or production environment.
-    - No Support: The authors of this code may not provide any support, assistance, or updates. You are using the code at your own risk and discretion.
-
-Before using this code, it is recommended to consult with a qualified professional and perform a comprehensive security assessment. By proceeding to use this code, you agree to assume all associated risks and responsibilities.
-*/
-
-#[lint_allow(self_transfer)]
-module dacade_deepbook::book {
-    use deepbook::clob_v2 as deepbook;
-    use deepbook::custodian_v2 as custodian;
+module dacade_deepbook::disaster_mgmt {
+    use std::string::{String}; 
+    use sui::coin::{Coin, split, put, take};
+    use sui::balance::{Balance, zero};
     use sui::sui::SUI;
-    use sui::tx_context::{TxContext, Self};
-    use sui::coin::{Coin, Self};
-    use sui::balance::{Self};
-    use sui::transfer::Self;
-    use sui::clock::Clock;
+    use sui::event;
 
-    const FLOAT_SCALING: u64 = 1_000_000_000;
+    /// Define errors
+    const ONLYOWNER: u64 = 0;
+    const INSUFFICIENTBALANCE: u64 = 1;
+    
 
-
-    public fun new_pool<Base, Quote>(payment: &mut Coin<SUI>, ctx: &mut TxContext) {
-        let balance = coin::balance_mut(payment);
-        let fee = balance::split(balance, 100 * 1_000_000_000);
-        let coin = coin::from_balance(fee, ctx);
-
-        deepbook::create_pool<Base, Quote>(
-            1 * FLOAT_SCALING,
-            1,
-            coin,
-            ctx
-        );
+    /// Relief Center Struct
+    public struct ReliefCenter has store, key {
+        id: UID,
+        name: String,
+        balance: Balance<SUI>,
     }
 
-    public fun new_custodian_account(ctx: &mut TxContext) {
-        transfer::public_transfer(deepbook::create_account(ctx), tx_context::sender(ctx))
+    /// Admin Capability
+    public struct AdminCap has key {
+        id: UID,
+        center_id: ID,
     }
 
-    public fun make_base_deposit<Base, Quote>(pool: &mut deepbook::Pool<Base, Quote>, coin: Coin<Base>, account_cap: &custodian::AccountCap) {
-        deepbook::deposit_base(pool, coin, account_cap)
+    /// Events for transparency
+    public struct DonationReceived has copy, drop {
+        donor: address,
+        amount: u64,
+        center_id: ID,
     }
 
-    public fun make_quote_deposit<Base, Quote>(pool: &mut deepbook::Pool<Base, Quote>, coin: Coin<Quote>, account_cap: &custodian::AccountCap) {
-        deepbook::deposit_quote(pool, coin, account_cap)
+    public struct FundsTransferred has copy, drop {
+        from_center_id: ID,
+        to_center_id: ID,
+        amount: u64,
     }
 
-    public fun withdraw_base<BaseAsset, QuoteAsset>(
-        pool: &mut deepbook::Pool<BaseAsset, QuoteAsset>,
-        quantity: u64,
-        account_cap: &custodian::AccountCap,
+    public struct FundsWithdrawn has copy, drop {
+        center_id: ID,
+        amount: u64,
+        recipient: address,
+    }
+
+    /// Create a new Relief Center
+    public entry fun create_relief_center(
+    name: String,
+    ctx: &mut TxContext
+) {
+    let id = object::new(ctx);
+    let center_id = object::uid_to_inner(&id); // Create center_id from id here.
+
+    let center = ReliefCenter {
+        id, // Use the original id for the ReliefCenter struct.
+        name,
+        balance: zero<SUI>(),
+    };
+
+    let admin_cap = AdminCap {
+        id: object::new(ctx), // Generate a new UID for AdminCap.
+        center_id, // Use the derived center_id here.
+    };
+
+    transfer::transfer(admin_cap, tx_context::sender(ctx));
+    transfer::share_object(center);
+}
+
+
+    /// Donate funds to a Relief Center
+    public entry fun donate_funds(
+    center: &mut ReliefCenter,
+    donation: &mut Coin<SUI>,
+    ctx: &mut TxContext
+) {
+    let donation_amount = donation.value(); // Get the amount to donate.
+    let split_donation = donation.split(donation_amount, ctx); // Split the coin.
+
+    put(&mut center.balance, split_donation); // Add the split donation to the center's balance.
+
+    event::emit(DonationReceived {
+        donor: tx_context::sender(ctx),
+        amount: donation_amount,
+        center_id: object::uid_to_inner(&center.id),
+    });
+}
+
+
+    /// Transfer funds between Relief Centers
+    public entry fun transfer_funds_between_centers(
+        from_center: &mut ReliefCenter,
+        to_center: &mut ReliefCenter,
+        amount: u64,
+        owner: &AdminCap,
         ctx: &mut TxContext
     ) {
-        let base = deepbook::withdraw_base(pool, quantity, account_cap, ctx);
-        transfer::public_transfer(base, tx_context::sender(ctx));
+        assert!(
+            &owner.center_id == object::uid_as_inner(&from_center.id),
+            ONLYOWNER
+        );
+        assert!(amount > 0 && amount <= from_center.balance.value(), INSUFFICIENTBALANCE);
+
+        let transfer_amount = take(&mut from_center.balance, amount, ctx);
+        put(&mut to_center.balance, transfer_amount);
+
+        event::emit(FundsTransferred {
+            from_center_id: object::uid_to_inner(&from_center.id),
+            to_center_id: object::uid_to_inner(&to_center.id),
+            amount,
+        });
     }
 
-    public fun withdraw_quote<BaseAsset, QuoteAsset>(
-        pool: &mut deepbook::Pool<BaseAsset, QuoteAsset>,
-        quantity: u64,
-        account_cap: &custodian::AccountCap,
+    /// Withdraw funds from a Relief Center
+    public entry fun withdraw_funds(
+        center: &mut ReliefCenter,
+        amount: u64,
+        recipient: address,
+        owner: &AdminCap,
         ctx: &mut TxContext
     ) {
-        let quote = deepbook::withdraw_quote(pool, quantity, account_cap, ctx);
-        transfer::public_transfer(quote, tx_context::sender(ctx));
-    }
-
-    public fun place_limit_order<Base, Quote>(
-        pool: &mut deepbook::Pool<Base, Quote>,
-        client_order_id: u64,
-        price: u64, 
-        quantity: u64, 
-        self_matching_prevention: u8,
-        is_bid: bool,
-        expire_timestamp: u64,
-        restriction: u8,
-        clock: &Clock,
-        account_cap: &custodian::AccountCap,
-        ctx: &mut TxContext
-    ): (u64, u64, bool, u64) {
-        deepbook::place_limit_order(
-            pool, 
-            client_order_id, 
-            price, 
-            quantity, 
-            self_matching_prevention, 
-            is_bid, 
-            expire_timestamp, 
-            restriction, 
-            clock, 
-            account_cap, 
-            ctx
-        )
-    }
-
-    public fun place_base_market_order<Base, Quote>(
-        pool: &mut deepbook::Pool<Base, Quote>,
-        account_cap: &custodian::AccountCap,
-        base_coin: Coin<Base>,
-        client_order_id: u64,
-        is_bid: bool,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        let quote_coin = coin::zero<Quote>(ctx);
-        let quantity = coin::value(&base_coin);
-        place_market_order(
-            pool,
-            account_cap,
-            client_order_id,
-            quantity,
-            is_bid,
-            base_coin,
-            quote_coin,
-            clock,
-            ctx
-        )
-    }
-
-    public fun place_quote_market_order<Base, Quote>(
-        pool: &mut deepbook::Pool<Base, Quote>,
-        account_cap: &custodian::AccountCap,
-        quote_coin: Coin<Quote>,
-        client_order_id: u64,
-        is_bid: bool,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        let base_coin = coin::zero<Base>(ctx);
-        let quantity = coin::value(&quote_coin);
-        place_market_order(
-            pool,
-            account_cap,
-            client_order_id,
-            quantity,
-            is_bid,
-            base_coin,
-            quote_coin,
-            clock,
-            ctx
-        )
-    }
-
-    fun place_market_order<Base, Quote>(
-        pool: &mut deepbook::Pool<Base, Quote>,
-        account_cap: &custodian::AccountCap,
-        client_order_id: u64,
-        quantity: u64,
-        is_bid: bool,
-        base_coin: Coin<Base>,
-        quote_coin: Coin<Quote>,
-        clock: &Clock, // @0x6 hardcoded id of the Clock object
-        ctx: &mut TxContext,
-    ) {
-        let (base, quote) = deepbook::place_market_order(
-            pool, 
-            account_cap, 
-            client_order_id, 
-            quantity, 
-            is_bid, 
-            base_coin, 
-            quote_coin, 
-            clock, 
-            ctx
+        assert!(
+            &owner.center_id == object::uid_as_inner(&center.id),
+            ONLYOWNER
         );
-        transfer::public_transfer(base, tx_context::sender(ctx));
-        transfer::public_transfer(quote, tx_context::sender(ctx));
+        assert!(amount > 0 && amount <= center.balance.value(), INSUFFICIENTBALANCE);
+
+        let withdraw_amount = take(&mut center.balance, amount, ctx);
+        transfer::public_transfer(withdraw_amount, recipient);
+
+        event::emit(FundsWithdrawn {
+            center_id: object::uid_to_inner(&center.id),
+            amount,
+            recipient,
+        });
     }
 
-    public fun swap_exact_base_for_quote<Base, Quote>(
-        pool: &mut deepbook::Pool<Base, Quote>,
-        client_order_id: u64,
-        account_cap: &custodian::AccountCap,
-        quantity: u64,
-        base_coin: Coin<Base>,
-        clock: &Clock,
-        ctx: &mut TxContext
-    ) {
-        let quote_coin = coin::zero<Quote>(ctx);
-        let (base, quote, _) = deepbook::swap_exact_base_for_quote(
-            pool,
-            client_order_id,
-            account_cap,
-            quantity,
-            base_coin,
-            quote_coin,
-            clock,
-            ctx
-        );
-        transfer::public_transfer(base, tx_context::sender(ctx));
-        transfer::public_transfer(quote, tx_context::sender(ctx));
-    }
-
-    public fun swap_exact_quote_for_base<Base, Quote>(
-        pool: &mut deepbook::Pool<Base, Quote>,
-        account_cap: &custodian::AccountCap,
-        quote_coin: Coin<Quote>,
-        client_order_id: u64,
-        quantity: u64,
-        clock: &Clock,
-        ctx: &mut TxContext,
-    ) {
-        let (base, quote, _) = deepbook::swap_exact_quote_for_base(
-            pool,
-            client_order_id,
-            account_cap,
-            quantity,
-            clock,
-            quote_coin,
-            ctx
-        );
-        transfer::public_transfer(base, tx_context::sender(ctx));
-        transfer::public_transfer(quote, tx_context::sender(ctx));
+    /// Get the balance of a Relief Center
+    public fun get_center_balance(center: &ReliefCenter): u64 {
+        center.balance.value()
     }
 }
+
